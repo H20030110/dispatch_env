@@ -291,6 +291,7 @@ class DispatchEnv:
         action_mask = build_action_mask(candidate_mask=cand_mask, num_modes=self.num_modes)
 
         # [Debug] 仅当 debug=True 且前3次时打印
+
         if self.cfg.get("debug", False):
             if not hasattr(self, "_dbg_am_cnt"):
                 self._dbg_am_cnt = 0
