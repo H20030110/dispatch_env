@@ -27,6 +27,7 @@ r_reject: -0.5
 r_hold: -0.01          # 稍微惩罚一点点即可
 r_complete: 5.0        # 给大一点的糖，鼓励完成
 
+
 # dqn
 gamma: 0.99
 lr: 0.0005
@@ -37,7 +38,7 @@ train_every: 4
 target_update_every: 500
 eps_start: 1.0
 eps_end: 0.05
-eps_decay_steps: 10000
+eps_decay_steps: 5000
 max_grad_norm: 10.0
 hidden_sizes: [128, 128]
 
