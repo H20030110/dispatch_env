@@ -1,0 +1,45 @@
+seed: 42
+
+# toy map
+num_nodes: 20
+episode_horizon: 3600
+
+# fleet: 保持 2 辆车
+fleet_size: 2
+vehicle_capacity: 1
+
+# order stream: 改为 50 单，间隔 60 秒（这样2辆车基本忙得过来）
+num_orders: 50
+interarrival_mean: 60
+
+# hold logic
+hold_delay: 60
+hold_delay_min: 5
+max_hold_per_order: 3  # 减少尝试次数，不行就早点拒，省步数
+
+# candidates
+num_candidates: 5
+
+# reward shaping: 加大完成奖励，减少等待惩罚
+r_accept_success: 0.5
+r_accept_fail: -0.5
+r_reject: -0.5
+r_hold: -0.01          # 稍微惩罚一点点即可
+r_complete: 5.0        # 给大一点的糖，鼓励完成
+
+# dqn
+gamma: 0.99
+lr: 0.0005
+batch_size: 64
+replay_size: 50000
+warmup_steps: 1000
+train_every: 4
+target_update_every: 500
+eps_start: 1.0
+eps_end: 0.05
+eps_decay_steps: 10000
+max_grad_norm: 10.0
+hidden_sizes: [128, 128]
+
+# 默认关闭 debug
+debug: false
