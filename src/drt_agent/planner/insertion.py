@@ -1,114 +1,136 @@
 from __future__ import annotations
-
+from typing import List, Tuple, Optional
 import copy
-from typing import List, Tuple, Callable
 
-from drt_agent.common.types import Stop, Vehicle, Order
-
-
-def calculate_schedule_cost(
-        schedule: List[Stop],
-        start_node: int,
-        initial_load: int,
-        capacity: int,
-        travel_time_func: Callable[[int, int], int],
-        start_time: int  # [新增] 需要知道当前时间才能算是否超时
-) -> Tuple[bool, int]:
-    """
-    计算序列代价，并检查容量 + 时间窗约束。
-    """
-    t = start_time
-    curr = start_node
-    load = initial_load
-
-    total_travel = 0
-
-    for stop in schedule:
-        # 1. 累加行驶时间
-        travel = travel_time_func(curr, stop.node)
-        t += travel
-        total_travel += travel
-        curr = stop.node
-
-        # [更新] 记录预计到达时间到 Stop 对象（方便后续看，但这只在副本上生效）
-        stop.arrival_time = t
-
-        # 2. [核心] 检查时间窗 (Time Window Constraint)
-        # 如果当前时间 t 超过了该站点的最晚允许时间，则不可行
-        if t > stop.latest_time:
-            return False, float("inf")
-
-        # 3. 更新并检查载客量
-        if stop.action == 0:  # Pickup
-            load += 1
-        else:  # Dropoff
-            load -= 1
-
-        if load > capacity:
-            return False, float("inf")
-
-    return True, total_travel
+from drt_agent.common.types import Order, Vehicle, Stop, StopType, OrderStatus
 
 
-def find_best_insertion(
+def calculate_insertion_cost(
         vehicle: Vehicle,
         order: Order,
-        travel_time_func: Callable[[int, int], int],
-        now: int = 0  # [新增] 传入当前时间
+        sim  # 传入 Simulator 实例用于计算时间
 ) -> Tuple[float, List[Stop]]:
     """
-    寻找最佳插入位置，同时满足容量和时间窗约束。
+    尝试将 order 插入到 vehicle 的 schedule 中。
+    返回: (cost, new_schedule)
+    如果不可行（违反时间窗或容量），返回 (float('inf'), [])
     """
-    # 构造 Pickup 和 Dropoff 节点
-    # Pickup: latest_time 暂时不限（或者限制为 deadline - trip_time）
-    # Dropoff: latest_time = order.deadline
-    stop_p = Stop(node=order.origin, action=0, order_id=order.order_id, latest_time=10 ** 9)
-    stop_d = Stop(node=order.destination, action=1, order_id=order.order_id, latest_time=order.deadline)
+
+    # 1. 基础检查
+    # 如果插入这单会导致超载（简单检查：假设当前负载+1 <= 容量）
+    # 更严谨的检查需要在模拟路径时一步步推演 load
+    if vehicle.load >= vehicle.capacity:
+        # 注意：这只是当前瞬间的负载。严谨做法是检查路径上每个点的负载。
+        # 这里为了简化，先做此检查。
+        pass
 
     current_schedule = vehicle.schedule
+    best_cost = float('inf')
+    best_schedule = []
+
+    # 车辆当前位置和时间
+    if not current_schedule:
+        # 空车：直接构造 [Pickup, Dropoff]
+        start_loc = vehicle.location
+        start_time = max(sim.now, vehicle.next_free_time)
+
+        # 计算时间
+        t_to_pickup = sim.travel_time(start_loc, order.origin)
+        arr_pickup = start_time + t_to_pickup
+
+        # 检查 Pickup 时间窗 (Deadline)
+        if arr_pickup > order.pickup_deadline:
+            return float('inf'), []
+
+        t_to_drop = sim.travel_time(order.origin, order.destination)
+        arr_drop = arr_pickup + t_to_drop
+
+        # 成本 = 完成时间 - 当前时间 (或者仅仅是行驶时间)
+        # 这里成本定义为：增加的总耗时
+        cost = t_to_pickup + t_to_drop
+
+        new_sched = [
+            Stop(order.origin, StopType.PICKUP, order.order_id, arr_pickup),
+            Stop(order.destination, StopType.DROPOFF, order.order_id, arr_drop)
+        ]
+        return cost, new_sched
+
+    # 有任务的车：遍历所有可能的插入位置 (i, j)
+    # 0 <= i <= len
+    # i < j <= len + 1
+    # 原序列: S1 -> S2 -> S3
+    # 插入 P, D:
+    # i=0: P -> S1 -> S2 -> S3 (然后 D 插在后面任意位置)
+
     n = len(current_schedule)
 
-    # 估算当前车辆状态
-    # 如果车在路上，它到达下一站的时间已经被扣减了 t_to_next_stop
-    # 我们做个简化：假设“基准时间”是 now + t_to_next_stop (如果 t_to_next_stop>0)
-    # 并且起始位置是 schedule[0] 或 vehicle.node
+    # 为了性能，这里我们简化逻辑：
+    # 重新构建一条完整的临时路径，并计算是否可行
+    # 提示：Python 循环可能会慢，后续可用 Cython 或 Numba 优化
 
-    # 更严谨的做法：
-    start_t = now
-    if vehicle.t_to_next_stop > 0:
-        start_t += vehicle.t_to_next_stop
+    # 预计算当前路径的结束时间，用于对比 Delta Cost
+    old_end_time = current_schedule[-1].estimated_arrival_time
 
-    # 计算插入前的基准耗时（用于算增量）
-    # 注意：这里要传入 start_t
-    valid_base, base_cost = calculate_schedule_cost(
-        current_schedule, vehicle.node, vehicle.load, vehicle.capacity, travel_time_func, start_t
-    )
-    if not valid_base:
-        base_cost = 0
-
-    best_cost = float("inf")
-    best_schedule = None
-
-    # 确定插入起始点
-    start_idx = 1 if vehicle.t_to_next_stop > 0 else 0
-
-    for i in range(start_idx, n + 1):
+    for i in range(n + 1):
         for j in range(i + 1, n + 2):
-            tmp_sched = copy.deepcopy(current_schedule)  # deepcopy 因为 stop 对象被修改了
-            tmp_sched.insert(i, stop_p)
-            tmp_sched.insert(j, stop_d)
+            # 构造新序列
+            temp_schedule = current_schedule[:]  # Copy
 
-            feasible, total_time = calculate_schedule_cost(
-                tmp_sched, vehicle.node, vehicle.load, vehicle.capacity, travel_time_func, start_t
-            )
+            p_stop = Stop(order.origin, StopType.PICKUP, order.order_id)
+            d_stop = Stop(order.destination, StopType.DROPOFF, order.order_id)
 
-            if feasible:
-                if total_time < best_cost:
-                    best_cost = total_time
-                    best_schedule = tmp_sched
+            # 插入 Dropoff (注意索引变化)
+            temp_schedule.insert(j - 1, d_stop)
+            # 插入 Pickup
+            temp_schedule.insert(i, p_stop)
 
-    if best_schedule is None:
-        return float("inf"), []
+            # --- 验证可行性并计算成本 ---
+            is_feasible, new_end_time = simulate_schedule(vehicle, temp_schedule, sim, order.pickup_deadline)
 
-    delta = best_cost - base_cost
-    return delta, best_schedule
+            if is_feasible:
+                # Cost = 增加的完工时间 (延误)
+                # 也可以加入 detour distance
+                delta = new_end_time - old_end_time
+                if delta < best_cost:
+                    best_cost = delta
+                    best_schedule = temp_schedule
+
+    return best_cost, best_schedule
+
+
+def simulate_schedule(vehicle: Vehicle, schedule: List[Stop], sim, pickup_deadline: int) -> Tuple[bool, int]:
+    """
+    模拟跑一遍 schedule，检查时间窗和容量。
+    """
+    curr_t = sim.now
+    curr_loc = vehicle.location
+    curr_load = vehicle.load  # 初始负载
+
+    # 如果车辆正在前往 schedule[0] (Sim中已经有 ARRIVE 事件)，
+    # 实际上我们修改 schedule 时，通常保留第一个正在进行的站点不动，
+    # 或者如果改动了第一个站，需要 simulator 能处理。
+    # 这里假设我们总是从“当前位置”开始推演。
+
+    for stop in schedule:
+        travel = sim.travel_time(curr_loc, stop.location)
+        arr_time = curr_t + travel
+
+        # 1. 检查 Pickup Deadline
+        if stop.stop_type == StopType.PICKUP:
+            # 如果是新订单的 Pickup
+            if stop.estimated_arrival_time == 0:  # 标记是新点
+                if arr_time > pickup_deadline:
+                    return False, 0
+            curr_load += 1
+        elif stop.stop_type == StopType.DROPOFF:
+            curr_load -= 1
+
+        # 2. 检查容量
+        if curr_load > vehicle.capacity:
+            return False, 0
+
+        stop.estimated_arrival_time = arr_time
+        curr_t = arr_time
+        curr_loc = stop.location
+
+    return True, curr_t

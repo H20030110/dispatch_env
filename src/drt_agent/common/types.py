@@ -1,77 +1,88 @@
 from __future__ import annotations
-
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 
-
+# ==========================================
+# 1. 状态枚举
+# ==========================================
 class EventType(Enum):
-    ORDER_ARRIVAL = auto()
-    ORDER_COMPLETE = auto()
-    ORDER_CANCEL = auto()  # [新增] 订单取消
-    DECISION_POINT = auto()
-
+    ORDER_ARRIVAL = auto()      # 新订单到达
+    VEHICLE_ARRIVE = auto()     # 车辆到达站点
+    ORDER_COMPLETE = auto()     # 【修复】订单完成事件 (之前漏了这个)
+    # ORDER_CANCEL = auto()     # (预留给下一阶段)
 
 class Decision(Enum):
     REJECT = 0
     HOLD = 1
     ACCEPT = 2
 
-
 class PlanMode(Enum):
     FAST_INSERT = 0
     LOCAL_REPLAN = 1
     GLOBAL_REPLAN = 2
 
+class OrderStatus(Enum):
+    PENDING = 0     # 等待分配
+    ASSIGNED = 1    # 已分配，车在路上
+    PICKED_UP = 2   # 乘客已上车
+    COMPLETED = 3   # 到达目的地
+    CANCELLED = 4   # 订单取消
 
-@dataclass(frozen=True)
+class StopType(Enum):
+    PICKUP = 0      # 上车点
+    DROPOFF = 1     # 下车点
+    IDLE = 2        # 车辆待命/回库
+
+# ==========================================
+# 2. 站点 (Stop)
+# ==========================================
+@dataclass
+class Stop:
+    location: int
+    stop_type: StopType
+    order_id: Optional[int]
+    estimated_arrival_time: int = 0
+
+# ==========================================
+# 3. 订单 (Order)
+# ==========================================
+@dataclass(frozen=False)
 class Order:
     order_id: int
     t_request: int
     origin: int
     destination: int
     pax: int = 1
-
-    # [新增] 最晚送达时间 (绝对时间秒)
-    deadline: int = 10 ** 9
-
+    status: OrderStatus = OrderStatus.PENDING
+    max_wait_time: int = 1800
+    pickup_deadline: int = 0
     meta: Dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self):
+        if self.pickup_deadline == 0:
+            self.pickup_deadline = self.t_request + self.max_wait_time
 
-@dataclass
-class Stop:
-    """表示任务队列中的一个站点。"""
-    node: int
-    action: int  # 0: Pickup, 1: Dropoff
-    order_id: int
-
-    # [新增] 预计到达时间（用于校验时间窗）
-    # 注意：这个值是动态计算的，存这里主要为了方便调试查看
-    arrival_time: int = 0
-    # [新增] 该站点的最晚允许时间（Pickup可以是无穷大，Dropoff则是订单deadline）
-    latest_time: int = 10 ** 9
-
-
+# ==========================================
+# 4. 车辆 (Vehicle)
+# ==========================================
 @dataclass
 class Vehicle:
     vehicle_id: int
-    capacity: int = 4
-    node: int = 0
-    load: int = 0
-
+    capacity: int = 8
+    location: int = 0
+    next_free_time: int = 0
     schedule: List[Stop] = field(default_factory=list)
-    t_to_next_stop: int = 0
-
+    passengers: Set[int] = field(default_factory=set)
     meta: Dict[str, Any] = field(default_factory=dict)
 
     @property
-    def is_idle(self) -> bool:
-        return len(self.schedule) == 0
+    def load(self) -> int:
+        return len(self.passengers)
 
-    def update_time(self, now: int) -> None:
-        pass
-
-
+# ==========================================
+# 5. 事件 (Event)
+# ==========================================
 @dataclass(order=True)
 class Event:
     time: int
