@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 from typing import List, Tuple
-
 import numpy as np
 
 from drt_agent.common.types import Order, Vehicle
 from drt_agent.planner.base import Planner
+# [新增] 导入插入算法
+from drt_agent.planner.insertion import find_best_insertion
 
 
 class GreedyPlanner(Planner):
-    """学习版：极简候选生成器（toy）。
-
-    - 可行性：车辆是否空闲
-    - 特征：feasible, eta_pickup, delta_deadhead_km, cap_left
+    """
+    学习版 GreedyPlanner (升级为 Insertion 模式)。
+    策略：对每个车辆，尝试寻找最佳插入位置。
+    特征：feasible (是否可插入), delta_cost (增加时间), trip_time (订单原本时间), eta_complete
     """
 
     def __init__(self, vehicle_capacity: int):
@@ -23,37 +24,48 @@ class GreedyPlanner(Planner):
         vids = []
         mask = []
 
-        # 1. 遍历所有车辆生成特征
+        # 获取 travel_time 函数句柄
+        travel_func = self.sim.travel_time if hasattr(self, "sim") else (lambda u, v: int(abs(u - v) + 5))
+
         for v in vehicles:
-            available_in = max(0, int(v.busy_until - now))
+            # [核心] 调用插入算法
+            delta_cost, best_schedule = find_best_insertion(v, order, travel_func, now=now)
 
-            # 简单的可行性检查
-            feasible = 1.0 if (v.busy_until <= now and v.load < self.vehicle_capacity) else 0.0
+            # 判断可行性
+            is_feasible = (delta_cost != float("inf"))
 
-            deadhead = self.sim.travel_time(v.node, order.origin) if hasattr(self, "sim") else 0
-            trip = self.sim.travel_time(order.origin, order.destination) if hasattr(self, "sim") else 0
+            # 特征 1: 增加的 Detour 时间 (delta_cost)
+            # 如果不可行，给一个很大的惩罚值，方便排序排到后面
+            feat_delta = delta_cost if is_feasible else 1e5
 
-            # eta_complete
-            eta_complete = int(now + available_in + deadhead + trip)
+            # 特征 2: 订单本身的 Trip 时间
+            feat_trip = travel_func(order.origin, order.destination)
+
+            # 特征 3: 预计完成时间 (ETA)
+            # 这里的计算稍微估算一下：车辆做完所有任务的时间
+            finish_time_base = self.sim._predict_schedule_finish_time(v) if hasattr(self, "sim") else now
+            feat_eta = finish_time_base + feat_delta
+
+            # 特征 4: 车辆空闲时间 (available_in) - 估算
+            feat_avail = max(0, finish_time_base - now)
 
             vids.append(int(v.vehicle_id))
-            feats.append([available_in, deadhead, trip, eta_complete])
-            mask.append(feasible)
+            feats.append([feat_avail, feat_delta, feat_trip, feat_eta])
+            mask.append(1.0 if is_feasible else 0.0)
 
-        # 转为 numpy
+        # 转 numpy
         if len(vids) > 0:
             vids = np.array(vids, dtype=np.int64)
             feats = np.array(feats, dtype=np.float32)
             mask = np.array(mask, dtype=np.float32)
         else:
-            # 极端情况：没有车
             vids = np.array([], dtype=np.int64)
             feats = np.zeros((0, 4), dtype=np.float32)
             mask = np.array([], dtype=np.float32)
 
-        # 2. 排序：按 eta_complete 排序 (不可行的排后面)
-        # 构造排序键：feasible 的排前面(eta)，infeasible 的加个大数排后面
-        sort_key = feats[:, 3] if len(feats) > 0 else []
+        # 排序：优先选 Detour (feat_delta) 最小的
+        # 注意：这里我们改用 feat_delta (第2列，索引1) 进行排序，因为“顺路”最重要
+        sort_key = feats[:, 1] if len(feats) > 0 else []
         if len(mask) > 0:
             sort_key = sort_key + (1.0 - mask) * 1e9
 
@@ -67,30 +79,15 @@ class GreedyPlanner(Planner):
             selected_feats = np.zeros((0, 4), dtype=np.float32)
             selected_mask = np.array([], dtype=np.float32)
 
-        # 3. [关键修复] Padding 补齐到 K
-        # 如果选出来的数量不足 K，必须补“空数据”，保证 obs/mask 维度固定
+        # Padding 补齐
         current_count = len(selected_vids)
         if current_count < K:
             pad_size = K - current_count
-
-            # vids 补 -1
             pad_vids = np.full(pad_size, -1, dtype=np.int64)
             selected_vids = np.concatenate([selected_vids, pad_vids])
-
-            # feats 补 0 (维度要匹配: [pad_size, 4])
             pad_feats = np.zeros((pad_size, 4), dtype=np.float32)
             selected_feats = np.concatenate([selected_feats, pad_feats])
-
-            # mask 补 0 (不可行)
             pad_mask = np.zeros(pad_size, dtype=np.float32)
             selected_mask = np.concatenate([selected_mask, pad_mask])
-
-        # --- debug (可选) ---
-        if getattr(self, "cfg", None) is not None and self.cfg.get("debug", False):
-            if not hasattr(self, "_dbg_cnt"):
-                self._dbg_cnt = 0
-            if self._dbg_cnt < 3:
-                print(f"[DBG][planner] Padded to K={K}, mask sum={selected_mask.sum()}")
-                self._dbg_cnt += 1
 
         return selected_vids, selected_feats, selected_mask

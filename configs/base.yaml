@@ -9,7 +9,7 @@ fleet_size: 2
 vehicle_capacity: 1
 
 # order stream: 改为 50 单，间隔 60 秒（这样2辆车基本忙得过来）
-num_orders: 50
+num_orders: 100
 interarrival_mean: 60
 
 # hold logic
