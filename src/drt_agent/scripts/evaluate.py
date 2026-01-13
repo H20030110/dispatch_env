@@ -4,97 +4,124 @@ import argparse
 import yaml
 import numpy as np
 import torch
+from dataclasses import dataclass, asdict
+import csv
+from typing import List, Optional
 
 from drt_agent.env.dispatch_env import DispatchEnv
 from drt_agent.rl.dqn.network import QNetwork
 
 
+@dataclass
+class EvalResult:
+    ep: int
+    steps: int
+    total_reward: float
+    completed: int
+    cancelled: int
+    accept: int
+    reject: int
+    hold: int
+    acc_succ_rate: float
+
+
 def masked_argmax(q: np.ndarray, mask: np.ndarray) -> int:
+    # 将不可行动作的 Q 值设为负无穷
     q2 = np.where(mask > 0.5, q, -1e9)
+    # 如果所有动作都不可行（理论上不应发生），默认选 0
     return int(q2.argmax()) if (mask > 0.5).any() else 0
+
+
+def run_eval_episode(env: DispatchEnv, net: QNetwork, device: torch.device, ep: int, seed: int) -> EvalResult:
+    obs, mask = env.reset(seed=seed)
+    done = False
+    total_reward = 0.0
+    steps = 0
+
+    # 临时统计
+    out = None
+
+    while not done:
+        with torch.no_grad():
+            x = torch.tensor(obs[None, :], dtype=torch.float32, device=device)
+            q = net(x).squeeze(0).cpu().numpy()
+
+        action = masked_argmax(q, mask)
+        out = env.step(action)
+
+        total_reward += float(out.reward)
+        steps += 1
+        obs, mask, done = out.obs, out.action_mask, out.done
+
+    # 从 info 中提取最终统计 (依赖 DispatchEnv.step 的 info['stats'])
+    stats = out.info.get("stats", {}) if out else {}
+
+    return EvalResult(
+        ep=ep,
+        steps=steps,
+        total_reward=total_reward,
+        completed=int(stats.get("completed", 0)),
+        cancelled=int(stats.get("cancelled", 0)),
+        accept=int(stats.get("accept", 0)),
+        reject=int(stats.get("reject", 0)),
+        hold=int(stats.get("hold", 0)),
+        acc_succ_rate=float(stats.get("accept_success_rate", 0.0)),
+    )
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, default="configs/base.yaml")
-    ap.add_argument("--model", type=str, required=True)
+    ap.add_argument("--model", type=str, required=True, help="Path to model.pt")
     ap.add_argument("--episodes", type=int, default=10)
-    ap.add_argument("--seed", type=int, default=20000)
+    ap.add_argument("--seed0", type=int, default=30000, help="Evaluation seed")
+    ap.add_argument("--out_csv", type=str, default="", help="Save results to csv")
     args = ap.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
-    cfg["debug"] = False
+    # 构造环境
     env = DispatchEnv(cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # 加载模型
     net = QNetwork(env.obs_dim, env.num_actions, list(cfg["hidden_sizes"])).to(device)
-    print(f"[Eval] Loading model from: {args.model}")
-    try:
-        ckpt = torch.load(args.model, map_location=device)
-        net.load_state_dict(ckpt["q"])
-    except Exception as e:
-        print(f"[Error] Failed to load model: {e}")
-        return
-
+    print(f"[Eval] Loading model from {args.model} ...")
+    ckpt = torch.load(args.model, map_location=device)
+    net.load_state_dict(ckpt["q"])
     net.eval()
-    stats_list = []
 
-    print(f"\n[Eval] Start evaluation for {args.episodes} episodes...")
-    print("-" * 80)
+    results: List[EvalResult] = []
 
-    for ep in range(args.episodes):
-        obs, mask = env.reset(seed=args.seed + ep)
-        done = False
-        total_reward = 0.0
-        ep_info = {}
+    print(f"[Eval] Starting evaluation for {args.episodes} episodes...")
+    for i in range(args.episodes):
+        res = run_eval_episode(env, net, device, i, args.seed0 + i)
+        results.append(res)
+        print(
+            f"  Ep {res.ep}: R={res.total_reward:.1f}, Done={res.completed}, Cancel={res.cancelled}, Steps={res.steps}")
 
-        while not done:
-            with torch.no_grad():
-                x = torch.tensor(obs[None, :], dtype=torch.float32, device=device)
-                q = net(x).squeeze(0).cpu().numpy()
+    # 汇总统计
+    if results:
+        avg_r = np.mean([r.total_reward for r in results])
+        avg_done = np.mean([r.completed for r in results])
+        avg_cancel = np.mean([r.cancelled for r in results])
 
-            action = masked_argmax(q, mask)
-            out = env.step(action)
-            total_reward += out.reward
-            obs, mask, done = out.obs, out.action_mask, out.done
+        print("\n" + "=" * 60)
+        print(f"SUMMARY ({len(results)} eps):")
+        print(f"  Avg Reward   : {avg_r:.2f}")
+        print(f"  Avg Completed: {avg_done:.1f}")
+        print(f"  Avg Cancelled: {avg_cancel:.1f}")
+        print("=" * 60 + "\n")
 
-            if done:
-                ep_info = out.info.get("stats", {})
-
-        # [Fix] 兼容 acc_succ 和 accept_success 两种写法
-        n_succ = ep_info.get('acc_succ', ep_info.get('accept_success', 0))
-        n_fail = ep_info.get('acc_fail', ep_info.get('accept_fail', 0))
-        # 重新计算 rate (因为 env 返回的 rate 可能是旧 key)
-        den = max(1, n_succ + n_fail)
-        rate = n_succ / den
-
-        # 将修正后的数据存回去以便汇总
-        ep_info['corrected_succ'] = n_succ
-        ep_info['corrected_fail'] = n_fail
-        ep_info['corrected_rate'] = rate
-
-        print(f"[Eval] Ep {ep}: R={total_reward:.1f} | "
-              f"Accept={ep_info.get('accept', 0)} "
-              f"Reject={ep_info.get('reject', 0)} "
-              f"Hold={ep_info.get('hold', 0)} | "
-              f"Succ={n_succ} "
-              f"Fail={n_fail} "
-              f"Rate={rate:.2f}")
-
-        stats_list.append(ep_info)
-
-    avg_succ = np.mean([ep['corrected_succ'] for ep in stats_list])
-    avg_fail = np.mean([ep['corrected_fail'] for ep in stats_list])
-    avg_rate = np.mean([ep['corrected_rate'] for ep in stats_list])
-
-    print("-" * 80)
-    print(
-        f"[Summary] Avg Reward: {np.mean([ep.get('completed', 0) * env.r_complete for ep in stats_list]):.1f} (approx)")
-    print(f"[Summary] Avg Succ Rate: {avg_rate:.3f}")
-    print(f"[Summary] Avg Fail Count: {avg_fail:.1f} (Should be low)")
-    print("-" * 80)
+    # 保存 CSV
+    if args.out_csv:
+        with open(args.out_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(asdict(results[0]).keys()))
+            w.writeheader()
+            for r in results:
+                w.writerow(asdict(r))
+        print(f"[Eval] Saved detailed results to {args.out_csv}")
 
 
 if __name__ == "__main__":

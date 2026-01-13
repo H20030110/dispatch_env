@@ -10,7 +10,6 @@ import yaml
 from drt_agent.common.types import Order, Vehicle, Decision, PlanMode, Stop, StopType
 from drt_agent.sim.simulator import Simulator
 from drt_agent.planner.greedy_planner import GreedyPlanner
-# 【关键】引入插入算法
 from drt_agent.planner.insertion import calculate_insertion_cost
 from drt_agent.env.obs_builder import ObsSpec, flatten_obs, build_action_mask
 
@@ -26,11 +25,7 @@ class StepOutput:
 
 class DispatchEnv:
     """
-    DARP 调度环境 (Phase 2 完成版)
-    支持：
-    1. 车辆按 Schedule 行驶 (Simulator)
-    2. 贪心插入算法 (Insertion Heuristic)
-    3. 完整的统计 (Accept/Complete)
+    DARP 调度环境 (Phase 3 最终修复版)
     """
 
     def __init__(self, config: Dict[str, Any]) -> None:
@@ -45,7 +40,6 @@ class DispatchEnv:
 
         self.num_orders = int(self.cfg["num_orders"])
         self.interarrival_mean = float(self.cfg["interarrival_mean"])
-        self.hold_delay = int(self.cfg["hold_delay"])
 
         self.hold_delay_min = int(self.cfg.get("hold_delay_min", 5))
         self.max_hold_per_order = int(self.cfg.get("max_hold_per_order", 5))
@@ -65,7 +59,6 @@ class DispatchEnv:
         self.sim: Optional[Simulator] = None
         self.current_order_id: Optional[int] = None
 
-        # order_feat(4) + global_feat(1) + cand_feats(K*4) + cand_mask(K)
         self.obs_dim = 4 + 1 + self.K * 4 + self.K
         self.num_actions = 2 + self.K * self.num_modes
         self.spec = ObsSpec(
@@ -84,7 +77,7 @@ class DispatchEnv:
         return DispatchEnv(cfg)
 
     # -------------------------
-    # 内部初始化逻辑
+    # 初始化
     # -------------------------
     def _generate_orders(self) -> List[Order]:
         orders: List[Order] = []
@@ -104,13 +97,12 @@ class DispatchEnv:
     def _init_vehicles(self) -> List[Vehicle]:
         vehicles: List[Vehicle] = []
         for vid in range(self.fleet_size):
-            # Phase 2: 使用 location 初始化
             loc = int(self.rng.integers(0, self.num_nodes))
             vehicles.append(Vehicle(vehicle_id=vid, capacity=self.vehicle_capacity, location=loc))
         return vehicles
 
     # -------------------------
-    # RL 核心接口
+    # Reset
     # -------------------------
     def reset(self, seed: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
         if seed is not None:
@@ -130,19 +122,23 @@ class DispatchEnv:
         res = self.sim.run_until_next_arrival()
         self.current_order_id = res.decision_order_id
 
-        # episode stats
+        # 重置统计
         self.n_accept = 0
         self.n_reject = 0
         self.n_hold = 0
         self.n_accept_success = 0
         self.n_completed = 0
         self.n_accept_fail = 0
+        self.n_cancelled = 0
 
         self._hold_counts = {}
 
         obs, mask = self._build_obs_and_mask()
         return obs, mask
 
+    # -------------------------
+    # Step
+    # -------------------------
     def step(self, action_id: int) -> StepOutput:
         assert self.sim is not None, "Call reset() first."
         assert self.current_order_id is not None, "No current order to decide."
@@ -168,7 +164,6 @@ class DispatchEnv:
         # --- 分支逻辑 ---
         if decision == Decision.REJECT:
             reward += self.r_reject
-            # 拒绝，无事发生，处理下一单
 
         elif decision == Decision.HOLD:
             reward += self.r_hold
@@ -177,9 +172,8 @@ class DispatchEnv:
 
             if hc > self.max_hold_per_order:
                 reward += self.r_reject
-                self.n_reject += 1  # 统计为被动拒绝
+                self.n_reject += 1
             else:
-                # 寻找未来空闲时间
                 future_times = []
                 for v in vehicles:
                     if not v.schedule:
@@ -188,13 +182,11 @@ class DispatchEnv:
                         future_times.append(v.schedule[-1].estimated_arrival_time)
 
                 ft = [t for t in future_times if t > self.sim.now]
-
                 if not ft:
                     delay = self.hold_delay_min
                 else:
                     delay = max(self.hold_delay_min, min(ft) - self.sim.now)
 
-                # 限制最大 delay
                 delay = min(delay, 3600)
                 self.sim.defer_order(order.order_id, int(delay))
                 info["hold_delay"] = int(delay)
@@ -208,9 +200,7 @@ class DispatchEnv:
                 vid = int(cand_vehicle_ids[cand_k])
                 vehicle = self.sim.vehicles[vid]
 
-                # ==========================================
-                # Phase 2: 调用插入算法
-                # ==========================================
+                # Phase 2: 插入算法
                 cost, new_schedule = calculate_insertion_cost(vehicle, order, self.sim)
 
                 if new_schedule:
@@ -226,19 +216,22 @@ class DispatchEnv:
 
         # --- 推进仿真 ---
         res = self.sim.run_until_next_arrival()
-        completed = res.completed_orders
+        completed = res.completed_orders  # 这是一个 List[int]
 
-        # 奖励完成订单
         reward += self.r_complete * float(len(completed))
         self.n_completed += len(completed)
-        info["completed_count"] = len(completed)
+
+        # 【关键修复】使用 run_random.py 能识别的 Key
+        info["completed_in_between"] = completed
+        info["completed_count"] = len(completed)  # 保留这个以备他用
 
         self.current_order_id = res.decision_order_id
         done = self.current_order_id is None
 
         # --- 结束处理 ---
         if done:
-            # 统计汇总
+            self.n_cancelled = sum(1 for o in self.sim.orders.values() if o.status.name == "CANCELLED")
+
             den = max(1, self.n_accept_success + self.n_accept_fail)
             info["stats"] = {
                 "accept": int(self.n_accept),
@@ -247,6 +240,7 @@ class DispatchEnv:
                 "accept_success": int(self.n_accept_success),
                 "accept_fail": int(self.n_accept_fail),
                 "completed": int(self.n_completed),
+                "cancelled": int(self.n_cancelled),
                 "accept_success_rate": float(self.n_accept_success / den),
             }
 
@@ -257,9 +251,6 @@ class DispatchEnv:
         obs, mask = self._build_obs_and_mask()
         return StepOutput(obs=obs, action_mask=mask, reward=float(reward), done=False, info=info)
 
-    # -------------------------
-    # 辅助函数
-    # -------------------------
     def _build_obs_and_mask(self) -> Tuple[np.ndarray, np.ndarray]:
         assert self.sim is not None and self.current_order_id is not None
         now = self.sim.now
